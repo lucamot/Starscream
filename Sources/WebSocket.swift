@@ -41,13 +41,20 @@ public enum CloseCode : UInt16 {
     case messageTooBig          = 1009
 }
 
-//Error codes
-enum InternalErrorCode: UInt16 {
-    // 0-999 WebSocket status codes not used
-    case outputStreamWriteError = 1
-    case compressionError = 2
-    case invalidSSLError = 3
-    case writeTimeoutError = 4
+public enum ErrorType: Error {
+    case outputStreamWriteError //output stream error during write
+    case compressionError
+    case invalidSSLError //Invalid SSL certificate
+    case writeTimeoutError //The socket timed out waiting to be ready to write
+    case protocolError //There was an error parsing the WebSocket frames
+    case upgradeError //There was an error during the HTTP upgrade
+    case closeError //There was an error during the close (socket probably has been dereferenced)
+}
+
+public struct WSError: Error {
+    public let type: ErrorType
+    public let message: String
+    public let code: Int
 }
 
 //WebSocketClient is setup to be dependency injection for testing
@@ -132,6 +139,8 @@ open class FoundationStream : NSObject, WSStream, StreamDelegate  {
     private var outputStream: OutputStream?
     public weak var delegate: WSStreamDelegate?
     let BUFFER_MAX = 4096
+	
+	public var enableSOCKSProxy = false
     
     public func connect(url: URL, port: Int, timeout: TimeInterval, ssl: SSLSettings, completion: @escaping ((Error?) -> Void)) {
         var readStream: Unmanaged<CFReadStream>?
@@ -140,6 +149,18 @@ open class FoundationStream : NSObject, WSStream, StreamDelegate  {
         CFStreamCreatePairWithSocketToHost(nil, h, UInt32(port), &readStream, &writeStream)
         inputStream = readStream!.takeRetainedValue()
         outputStream = writeStream!.takeRetainedValue()
+
+        #if os(watchOS) //watchOS us unfortunately is missing the kCFStream properties to make this work
+        #else
+            if enableSOCKSProxy {
+                let proxyDict = CFNetworkCopySystemProxySettings()
+                let socksConfig = CFDictionaryCreateMutableCopy(nil, 0, proxyDict!.takeRetainedValue())
+                let propertyKey = CFStreamPropertyKey(rawValue: kCFStreamPropertySOCKSProxy)
+                CFWriteStreamSetProperty(outputStream, propertyKey, socksConfig)
+                CFReadStreamSetProperty(inputStream, propertyKey, socksConfig)
+            }
+        #endif
+        
         guard let inStream = inputStream, let outStream = outputStream else { return }
         inStream.delegate = self
         outStream.delegate = self
@@ -173,10 +194,10 @@ open class FoundationStream : NSObject, WSStream, StreamDelegate  {
                     let resIn = SSLSetEnabledCiphers(sslContextIn, cipherSuites, cipherSuites.count)
                     let resOut = SSLSetEnabledCiphers(sslContextOut, cipherSuites, cipherSuites.count)
                     if resIn != errSecSuccess {
-                        completion(errorWithDetail("Error setting ingoing cypher suites", code: UInt16(resIn)))
+                        completion(WSError(type: .invalidSSLError, message: "Error setting ingoing cypher suites", code: Int(resIn)))
                     }
                     if resOut != errSecSuccess {
-                        completion(errorWithDetail("Error setting outgoing cypher suites", code: UInt16(resOut)))
+                        completion(WSError(type: .invalidSSLError, message: "Error setting outgoing cypher suites", code: Int(resOut)))
                     }
                 }
                 #endif
@@ -195,13 +216,14 @@ open class FoundationStream : NSObject, WSStream, StreamDelegate  {
                 usleep(100) // wait until the socket is ready
                 out -= 100
                 if out < 0 {
-                    guard let s = self else {return}
-                    let errCode = InternalErrorCode.writeTimeoutError.rawValue
-                    completion(s.errorWithDetail("write wait timed out", code: errCode))
+                    completion(WSError(type: .writeTimeoutError, message: "Timed out waiting for the socket to be ready for a write", code: 0))
                     return
                 } else if let error = outStream.streamError {
                     completion(error)
                     return // disconnectStream will be called.
+                } else if self == nil {
+                    completion(WSError(type: .closeError, message: "socket object has been dereferenced", code: 0))
+                    return
                 }
             }
             completion(nil) //success!
@@ -209,15 +231,16 @@ open class FoundationStream : NSObject, WSStream, StreamDelegate  {
     }
     
     public func write(data: Data) -> Int {
-        guard let outStream = outputStream else {return 0}
+        guard let outStream = outputStream else {return -1}
         let buffer = UnsafeRawPointer((data as NSData).bytes).assumingMemoryBound(to: UInt8.self)
         return outStream.write(buffer, maxLength: data.count)
     }
     
     public func read() -> Data? {
+        guard let stream = inputStream else {return nil}
         let buf = NSMutableData(capacity: BUFFER_MAX)
         let buffer = UnsafeMutableRawPointer(mutating: buf!.bytes).assumingMemoryBound(to: UInt8.self)
-        let length = inputStream!.read(buffer, maxLength: BUFFER_MAX)
+        let length = stream.read(buffer, maxLength: BUFFER_MAX)
         if length < 1 {
             return nil
         }
@@ -225,13 +248,13 @@ open class FoundationStream : NSObject, WSStream, StreamDelegate  {
     }
     
     public func cleanup() {
-        outputStream?.delegate = nil
-        inputStream?.delegate = nil
         if let stream = inputStream {
+            stream.delegate = nil
             CFReadStreamSetDispatchQueue(stream, nil)
             stream.close()
         }
         if let stream = outputStream {
+            stream.delegate = nil
             CFWriteStreamSetDispatchQueue(stream, nil)
             stream.close()
         }
@@ -274,12 +297,6 @@ open class FoundationStream : NSObject, WSStream, StreamDelegate  {
         } else if eventCode == .endEncountered {
             delegate?.streamDidError(error: nil)
         }
-    }
-    
-    private func errorWithDetail(_ detail: String, code: UInt16) -> Error {
-        var details = [String: String]()
-        details[NSLocalizedDescriptionKey] =  detail
-        return NSError(domain: WebSocket.ErrorDomain, code: Int(code), userInfo: details) as Error
     }
 }
 
@@ -398,7 +415,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
         connectedMutex.unlock()
         return isConnected
     }
-
+    public var request: URLRequest //this is only public to allow headers, timeout, etc to be modified on reconnect
     public var currentURL: URL { return request.url! }
 
     public var respondToPingWithPong: Bool = true
@@ -415,8 +432,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
         var decompressor:Decompressor? = nil
         var compressor:Compressor? = nil
     }
-
-    private var request: URLRequest
+    
     private var stream: WSStream
     private var connected = false
     private var isConnecting = false
@@ -573,7 +589,8 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
             let val = "permessage-deflate; client_max_window_bits; server_max_window_bits=15"
             request.setValue(val, forHTTPHeaderField: headerWSExtensionName)
         }
-        request.setValue("\(url.host!):\(port!)", forHTTPHeaderField: headerWSHostName)
+        let hostValue = request.allHTTPHeaderFields?[headerWSHostName] ?? "\(url.host!):\(port!)"
+        request.setValue(hostValue, forHTTPHeaderField: headerWSHostName)
 
         var path = url.absoluteString
         let offset = (url.scheme?.count ?? 2) + 3
@@ -646,7 +663,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
         stream.connect(url: url, port: port, timeout: timeout, ssl: settings, completion: { [weak self] (error) in
             guard let s = self else {return}
             if error != nil {
-                //do disconnect
+                s.disconnectStream(error)
                 return
             }
             let operation = BlockOperation()
@@ -665,9 +682,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
                             s.certValidated = false
                         }
                         if !s.certValidated {
-                            let errCode = InternalErrorCode.invalidSSLError.rawValue
-                            let error = s.errorWithDetail("Invalid SSL certificate", code: errCode)
-                            s.disconnectStream(error)
+                            s.disconnectStream(WSError(type: .invalidSSLError, message: "Invalid SSL certificate", code: 0))
                             return
                         }
                     }
@@ -774,7 +789,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
             fragBuffer = Data(bytes: buffer, count: bufferLen)
             break // do nothing, we are going to collect more data
         default:
-            doDisconnect(errorWithDetail("Invalid HTTP upgrade", code: UInt16(code)))
+            doDisconnect(WSError(type: .upgradeError, message: "Invalid HTTP upgrade", code: code))
         }
     }
 
@@ -973,7 +988,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
             }
             if (isMasked > 0 || (RSVMask & baseAddress[0]) > 0) && receivedOpcode != .pong && !compressionState.messageNeedsDecompression {
                 let errCode = CloseCode.protocolError.rawValue
-                doDisconnect(errorWithDetail("masked and rsv data is not currently supported", code: errCode))
+                doDisconnect(WSError(type: .protocolError, message: "masked and rsv data is not currently supported", code: Int(errCode)))
                 writeError(errCode)
                 return emptyBuffer
             }
@@ -981,13 +996,13 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
             if !isControlFrame && (receivedOpcode != .binaryFrame && receivedOpcode != .continueFrame &&
                 receivedOpcode != .textFrame && receivedOpcode != .pong) {
                     let errCode = CloseCode.protocolError.rawValue
-                    doDisconnect(errorWithDetail("unknown opcode: \(receivedOpcodeRawValue)", code: errCode))
+                    doDisconnect(WSError(type: .protocolError, message: "unknown opcode: \(receivedOpcodeRawValue)", code: Int(errCode)))
                     writeError(errCode)
                     return emptyBuffer
             }
             if isControlFrame && isFin == 0 {
                 let errCode = CloseCode.protocolError.rawValue
-                doDisconnect(errorWithDetail("control frames can't be fragmented", code: errCode))
+                doDisconnect(WSError(type: .protocolError, message: "control frames can't be fragmented", code: Int(errCode)))
                 writeError(errCode)
                 return emptyBuffer
             }
@@ -1002,7 +1017,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
                     }
                 }
                 if payloadLen < 2 {
-                    doDisconnect(errorWithDetail("connection closed by server", code: closeCode))
+                    doDisconnect(WSError(type: .protocolError, message: "connection closed by server", code: Int(closeCode)))
                     writeError(closeCode)
                     return emptyBuffer
                 }
@@ -1041,7 +1056,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
                 } catch {
                     let closeReason = "Decompression failed: \(error)"
                     let closeCode = CloseCode.encoding.rawValue
-                    doDisconnect(errorWithDetail(closeReason, code: closeCode))
+                    doDisconnect(WSError(type: .protocolError, message: closeReason, code: Int(closeCode)))
                     writeError(closeCode)
                     return emptyBuffer
                 }
@@ -1056,7 +1071,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
                 } else {
                     closeCode = CloseCode.protocolError.rawValue
                 }
-                doDisconnect(errorWithDetail(closeReason, code: closeCode))
+                doDisconnect(WSError(type: .protocolError, message: closeReason, code: Int(closeCode)))
                 writeError(closeCode)
                 return emptyBuffer
             }
@@ -1077,7 +1092,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
             }
             if isFin == 0 && receivedOpcode == .continueFrame && response == nil {
                 let errCode = CloseCode.protocolError.rawValue
-                doDisconnect(errorWithDetail("continue frame before a binary or text frame", code: errCode))
+                doDisconnect(WSError(type: .protocolError, message: "continue frame before a binary or text frame", code: Int(errCode)))
                 writeError(errCode)
                 return emptyBuffer
             }
@@ -1085,8 +1100,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
             if response == nil {
                 if receivedOpcode == .continueFrame {
                     let errCode = CloseCode.protocolError.rawValue
-                    doDisconnect(errorWithDetail("first frame can't be a continue frame",
-                        code: errCode))
+                    doDisconnect(WSError(type: .protocolError, message: "first frame can't be a continue frame", code: Int(errCode)))
                     writeError(errCode)
                     return emptyBuffer
                 }
@@ -1100,8 +1114,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
                     response!.bytesLeft = Int(dataLength)
                 } else {
                     let errCode = CloseCode.protocolError.rawValue
-                    doDisconnect(errorWithDetail("second and beyond of fragment message must be a continue frame",
-                        code: errCode))
+                    doDisconnect(WSError(type: .protocolError, message: "second and beyond of fragment message must be a continue frame", code: Int(errCode)))
                     writeError(errCode)
                     return emptyBuffer
                 }
@@ -1176,15 +1189,6 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
     }
 
     /**
-     Create an error
-     */
-    private func errorWithDetail(_ detail: String, code: UInt16) -> Error {
-        var details = [String: String]()
-        details[NSLocalizedDescriptionKey] =  detail
-        return NSError(domain: WebSocket.ErrorDomain, code: Int(code), userInfo: details) as Error
-    }
-
-    /**
      Write an error to the socket
      */
     private func writeError(_ code: UInt16) {
@@ -1243,14 +1247,15 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
             }
             var total = 0
             while !sOperation.isCancelled {
+                if !s.readyToWrite {
+                    s.doDisconnect(WSError(type: .outputStreamWriteError, message: "output stream had an error during write", code: 0))
+                    break
+                }
                 let stream = s.stream
                 let writeBuffer = UnsafeRawPointer(frame!.bytes+total).assumingMemoryBound(to: UInt8.self)
                 let len = stream.write(data: Data(bytes: writeBuffer, count: offset-total))
-                if len < 0 {
-                    var error: Error?
-                        let errCode = InternalErrorCode.outputStreamWriteError.rawValue
-                        error = s.errorWithDetail("output stream error during write", code: errCode)
-                    s.doDisconnect(error)
+                if len <= 0 {
+                    s.doDisconnect(WSError(type: .outputStreamWriteError, message: "output stream had an error during write", code: 0))
                     break
                 } else {
                     total += len
@@ -1328,3 +1333,12 @@ private extension UnsafeBufferPointer {
 }
 
 private let emptyBuffer = UnsafeBufferPointer<UInt8>(start: nil, count: 0)
+
+#if swift(>=4)
+#else
+fileprivate extension String {
+    var count: Int {
+        return self.characters.count
+    }
+}
+#endif
