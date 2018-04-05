@@ -70,7 +70,7 @@ public protocol WebSocketClient: class {
     #endif
     var isConnected: Bool {get}
     
-    func connect()
+    func connect(authorization: String?)
     func disconnect(forceTimeout: TimeInterval?, closeCode: UInt16)
     func write(string: String, completion: (() -> ())?)
     func write(data: Data, completion: (() -> ())?)
@@ -485,11 +485,11 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
     /**
      Connect to the WebSocket server on a background thread.
      */
-    open func connect() {
+    open func connect(authorization: String? = nil) {
         guard !isConnecting else { return }
         didDisconnect = false
         isConnecting = true
-        createHTTPRequest()
+        createHTTPRequest(authorization: authorization)
     }
 
     /**
@@ -566,7 +566,7 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
     /**
      Private method that starts the connection.
      */
-    private func createHTTPRequest() {
+    private func createHTTPRequest(authorization: String? = nil) {
         guard let url = request.url else {return}
         var port = url.port
         if port == nil {
@@ -581,7 +581,9 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
         headerSecKey = generateWebSocketKey()
         request.setValue(headerWSVersionValue, forHTTPHeaderField: headerWSVersionName)
         request.setValue(headerSecKey, forHTTPHeaderField: headerWSKeyName)
-        request.setValue("Basic ZGVtbzVnOmNvbnNfMjAxOCE=", forHTTPHeaderField: "Authorization")
+        if let a = authorization {
+            request.setValue(a, forHTTPHeaderField: "Authorization")
+        }
         
         if enableCompression {
             let val = "permessage-deflate; client_max_window_bits; server_max_window_bits=15"
